@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.lan-browser-data/
+*.log
