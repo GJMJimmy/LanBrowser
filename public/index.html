@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>LAN Browser</title>
+  <link rel="stylesheet" href="/app.css?v=0.3.0">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="toolbar">
+      <div class="brand" aria-label="LAN Browser">
+        <span class="brand-mark"><i data-lucide="monitor-up"></i></span>
+        <span>LAN Browser</span>
+      </div>
+      <nav class="navigation" aria-label="浏览器导航">
+        <button id="back" class="icon-button" type="button" title="后退" disabled><i data-lucide="arrow-left"></i></button>
+        <button id="forward" class="icon-button" type="button" title="前进" disabled><i data-lucide="arrow-right"></i></button>
+        <button id="reload" class="icon-button" type="button" title="刷新" disabled><i data-lucide="rotate-cw"></i></button>
+      </nav>
+      <form id="address-form" class="address-form">
+        <i class="address-lock" data-lucide="shield-check"></i>
+        <input id="address" type="text" inputmode="url" autocomplete="off" spellcheck="false" aria-label="地址" placeholder="输入网址" disabled>
+        <button class="go-button" type="submit" title="访问" disabled><i data-lucide="arrow-right"></i></button>
+      </form>
+      <div id="status-chip" class="status-chip" data-state="offline">
+        <span class="status-dot"></span>
+        <span id="status-text">未连接</span>
+      </div>
+      <button id="disconnect" class="icon-button" type="button" title="断开会话" disabled><i data-lucide="log-out"></i></button>
+      <button id="audio-toggle" class="icon-button" type="button" title="静音" aria-pressed="false" disabled><i data-lucide="volume-2"></i></button>
+      <button id="display-settings" class="icon-button" type="button" title="画面分辨率" aria-expanded="false" disabled><i data-lucide="monitor-cog"></i></button>
+      <button id="mobile-keyboard" class="icon-button mobile-keyboard-button" type="button" title="键盘" disabled><i data-lucide="keyboard"></i></button>
+    </header>
+
+    <section id="viewport" class="viewport" tabindex="0" aria-label="远程浏览器画面">
+      <img id="frame" alt="远程浏览器画面" draggable="false">
+      <div id="empty-state" class="empty-state">
+        <div class="empty-icon"><i data-lucide="radio-tower"></i></div>
+        <h1>连接服务端浏览器</h1>
+        <form id="connect-form" class="connect-form">
+          <label for="token">访问口令</label>
+          <div class="token-row">
+            <input id="token" type="password" autocomplete="current-password" placeholder="输入服务启动时显示的口令">
+            <button id="connect" class="primary-button" type="submit">连接</button>
+          </div>
+        </form>
+        <p id="connect-error" class="connect-error" role="alert"></p>
+      </div>
+      <div id="loading-state" class="loading-state" hidden>
+        <span class="spinner"></span>
+        <span id="loading-text">正在建立安全连接</span>
+      </div>
+      <div id="toast" class="toast" role="status" hidden></div>
+    </section>
+    <footer class="session-bar">
+      <span><i data-lucide="server"></i> 服务端渲染</span>
+      <span><i data-lucide="radio"></i> WebRTC</span>
+      <span id="resolution"><i data-lucide="scan"></i> --</span>
+    </footer>
+    <aside id="display-panel" class="settings-popover" hidden>
+      <form id="resolution-form">
+        <div class="settings-heading">画面分辨率</div>
+        <label class="auto-resolution"><input id="auto-resolution" type="checkbox" checked> 自动适应窗口</label>
+        <div class="resolution-fields">
+          <label for="resolution-width">宽度<input id="resolution-width" type="number" min="320" max="3840" step="1" value="1440" disabled></label>
+          <span>×</span>
+          <label for="resolution-height">高度<input id="resolution-height" type="number" min="240" max="2160" step="1" value="900" disabled></label>
+        </div>
+        <button class="primary-button settings-apply" type="submit">应用</button>
+      </form>
+    </aside>
+    <textarea id="mobile-input" class="mobile-input" aria-label="远程键盘输入" inputmode="text" enterkeyhint="enter" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+  </main>
+  <script src="/lucide.min.js"></script>
+  <script type="module" src="/app.js?v=0.3.2"></script>
+</body>
+</html>
