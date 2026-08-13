@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>LAN Browser</title>
-  <link rel="stylesheet" href="/app.css?v=0.3.0">
+  <link rel="stylesheet" href="/app.css?v=0.3.4">
 </head>
 <body>
   <main class="app-shell">
@@ -30,7 +30,8 @@
       </div>
       <button id="disconnect" class="icon-button" type="button" title="断开会话" disabled><i data-lucide="log-out"></i></button>
       <button id="audio-toggle" class="icon-button" type="button" title="静音" aria-pressed="false" disabled><i data-lucide="volume-2"></i></button>
-      <button id="display-settings" class="icon-button" type="button" title="画面分辨率" aria-expanded="false" disabled><i data-lucide="monitor-cog"></i></button>
+      <button id="display-settings" class="icon-button" type="button" title="画面与页面缩放" aria-expanded="false" disabled><i data-lucide="monitor-cog"></i></button>
+      <button id="interaction-mode" class="icon-button" type="button" title="电脑操作（点击切换为触屏操作）" aria-label="切换为触屏操作" aria-pressed="false" disabled><i data-lucide="mouse-pointer-2"></i></button>
       <button id="mobile-keyboard" class="icon-button mobile-keyboard-button" type="button" title="键盘" disabled><i data-lucide="keyboard"></i></button>
     </header>
 
@@ -60,6 +61,18 @@
       <span id="resolution"><i data-lucide="scan"></i> --</span>
     </footer>
     <aside id="display-panel" class="settings-popover" hidden>
+      <section class="zoom-settings" aria-labelledby="zoom-heading">
+        <div id="zoom-heading" class="settings-heading">页面缩放</div>
+        <div class="zoom-controls">
+          <button id="zoom-out" class="icon-button zoom-button" type="button" title="缩小页面" aria-label="缩小页面" disabled><i data-lucide="minus"></i></button>
+          <label class="zoom-value" for="zoom-percent">
+            <input id="zoom-percent" type="number" min="25" max="500" step="1" value="100" inputmode="numeric" aria-label="页面缩放百分比" disabled>
+            <span>%</span>
+          </label>
+          <button id="zoom-in" class="icon-button zoom-button" type="button" title="放大页面" aria-label="放大页面" disabled><i data-lucide="plus"></i></button>
+          <button id="zoom-reset" class="icon-button zoom-button" type="button" title="恢复 100%" aria-label="恢复 100%" disabled><i data-lucide="rotate-ccw"></i></button>
+        </div>
+      </section>
       <form id="resolution-form">
         <div class="settings-heading">画面分辨率</div>
         <label class="auto-resolution"><input id="auto-resolution" type="checkbox" checked> 自动适应窗口</label>
@@ -74,6 +87,6 @@
     <textarea id="mobile-input" class="mobile-input" aria-label="远程键盘输入" inputmode="text" enterkeyhint="enter" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
   </main>
   <script src="/lucide.min.js"></script>
-  <script type="module" src="/app.js?v=0.3.2"></script>
+  <script type="module" src="/app.js?v=0.3.4"></script>
 </body>
 </html>

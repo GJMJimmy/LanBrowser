@@ -24,7 +24,12 @@ const fixture = createServer((req, res) => {
     a,button,input{position:fixed;left:20px;width:220px;height:48px;z-index:10;font:16px sans-serif}
     a{top:20px;padding:14px;background:#111;color:#fff}button{top:82px}input{top:144px;padding:8px}
   </style><a href="/linked" target="_blank">OPEN LINK</a><button id="sound">PLAY SOUND</button><input id="text" placeholder="TYPE HERE"><script>
-    document.querySelector('#sound').onclick=()=>{const c=new AudioContext();const o=c.createOscillator();o.frequency.value=880;o.connect(c.destination);o.start();o.stop(c.currentTime+1.2)};
+    let context, oscillator;
+    document.querySelector('#sound').onclick=()=>{
+      if (oscillator) { oscillator.stop(); oscillator=null; return; }
+      context ||= new AudioContext();
+      oscillator=context.createOscillator();oscillator.frequency.value=880;oscillator.connect(context.destination);oscillator.start();
+    };
   </script>`);
 });
 
@@ -58,8 +63,15 @@ const connectClient = async () => {
   let audioChunks = [];
   const messages = [];
   frames.onMessage.subscribe((data) => { if (Buffer.isBuffer(data)) lastFrame = data; });
-  audio.onMessage.subscribe((data) => { if (Buffer.isBuffer(data)) audioChunks.push(data); });
-  control.onMessage.subscribe((data) => { if (typeof data === "string") messages.push(JSON.parse(data)); });
+  audio.onMessage.subscribe((data) => {
+    if (Buffer.isBuffer(data)) audioChunks.push(data);
+    else if (data === "reset") audioChunks = [];
+  });
+  control.onMessage.subscribe((data) => {
+    if (typeof data !== "string") return;
+    const message = JSON.parse(data);
+    messages.push(message);
+  });
   const channelsOpen = Promise.all([
     control.stateChanged.watch((state) => state === "open"),
     frames.stateChanged.watch((state) => state === "open"),
@@ -128,22 +140,67 @@ try {
   const client = await connectClient();
   try {
     await new Promise((resolve) => setTimeout(resolve, 500));
+    client.takeAudio();
+    client.control.send(JSON.stringify({ type: "mouse", event: "mousePressed", x: 100, y: 105, button: "left", buttons: 1, clickCount: 1, modifiers: 0 }));
+    client.control.send(JSON.stringify({ type: "mouse", event: "mouseReleased", x: 100, y: 105, button: "left", buttons: 0, clickCount: 1, modifiers: 0 }));
     const cachedAudioFormat = client.messages.find((message) => message.type === "audio-format");
     const audioFormat = cachedAudioFormat || JSON.parse(await timeout(client.control.onMessage.watch((data) => {
       if (typeof data !== "string") return false;
       return JSON.parse(data).type === "audio-format";
     }), "音频格式"));
-    client.takeAudio();
-    client.control.send(JSON.stringify({ type: "mouse", event: "mousePressed", x: 100, y: 105, button: "left", buttons: 1, clickCount: 1, modifiers: 0 }));
-    client.control.send(JSON.stringify({ type: "mouse", event: "mouseReleased", x: 100, y: 105, button: "left", buttons: 0, clickCount: 1, modifiers: 0 }));
-    await new Promise((resolve) => setTimeout(resolve, 1600));
+    await new Promise((resolve) => setTimeout(resolve, 1200));
     const rms = audioRms(client.takeAudio(), audioFormat);
     if (rms < 0.0001) throw new Error(`WebRTC 音频为静音 (RMS ${rms})`);
     console.log(`PASS WebRTC audio carried non-silent PCM (RMS ${rms.toFixed(5)})`);
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+    client.control.send(JSON.stringify({ type: "mouse", event: "mousePressed", x: 100, y: 105, button: "left", buttons: 1, clickCount: 1, modifiers: 0 }));
+    client.control.send(JSON.stringify({ type: "mouse", event: "mouseReleased", x: 100, y: 105, button: "left", buttons: 0, clickCount: 1, modifiers: 0 }));
+    client.takeAudio();
+    await new Promise((resolve) => setTimeout(resolve, 900));
     const tailRms = audioRms(client.takeAudio(), audioFormat);
     if (tailRms > 0.001) throw new Error(`测试音停止后仍有声音 (RMS ${tailRms})`);
     console.log("PASS audio became silent after playback stopped");
+
+    const ordinaryHit = client.control.onMessage.watch((data) => {
+      if (typeof data !== "string") return false;
+      const message = JSON.parse(data);
+      return message.type === "hit-test" && message.requestId === 101 && message.editable === false;
+    }, 5_000);
+    client.control.send(JSON.stringify({ type: "hitTest", requestId: 101, x: 100, y: 105 }));
+    await ordinaryHit;
+    console.log("PASS hit test classified a normal control as non-editable");
+
+    const editableHit = client.control.onMessage.watch((data) => {
+      if (typeof data !== "string") return false;
+      const message = JSON.parse(data);
+      return message.type === "hit-test" && message.requestId === 102 && message.editable === true;
+    }, 5_000);
+    client.control.send(JSON.stringify({ type: "hitTest", requestId: 102, x: 100, y: 168 }));
+    await editableHit;
+    console.log("PASS hit test classified the text field as editable");
+
+    const zoomed = client.control.onMessage.watch((data) => {
+      if (typeof data !== "string") return false;
+      const message = JSON.parse(data);
+      return message.type === "zoom" && message.percent === 200;
+    }, 5_000);
+    client.control.send(JSON.stringify({ type: "zoom", percent: 200 }));
+    await zoomed;
+    const zoomedEditableHit = client.control.onMessage.watch((data) => {
+      if (typeof data !== "string") return false;
+      const message = JSON.parse(data);
+      return message.type === "hit-test" && message.requestId === 103 && message.editable === true;
+    }, 5_000);
+    client.control.send(JSON.stringify({ type: "hitTest", requestId: 103, x: 400, y: 336 }));
+    await zoomedEditableHit;
+    console.log("PASS 200% zoom scaled the page and remote input coordinates together");
+
+    const resetZoom = client.control.onMessage.watch((data) => {
+      if (typeof data !== "string") return false;
+      const message = JSON.parse(data);
+      return message.type === "zoom" && message.percent === 100;
+    }, 5_000);
+    client.control.send(JSON.stringify({ type: "zoom", percent: 100 }));
+    await resetZoom;
 
     const editableFocus = client.control.onMessage.watch((data) => {
       if (typeof data !== "string") return false;
@@ -185,6 +242,15 @@ try {
     console.log("PASS disconnect released the browser and audio session");
   }
 } finally {
-  fixture.close();
-  browserService?.kill();
+  fixture.closeAllConnections?.();
+  await new Promise((resolve) => fixture.close(resolve));
+  if (browserService && browserService.exitCode === null) {
+    browserService.kill();
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 3_000);
+      browserService.once("exit", () => { clearTimeout(timer); resolve(); });
+    });
+  }
 }
+
+process.exit(0);

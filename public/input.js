@@ -69,6 +69,79 @@ export class TouchScrollBuffer {
   }
 }
 
+const INTERACTION_MODES = new Set(["computer", "touch"]);
+const INPUT_MODES = new Set(["none", "text", "decimal", "numeric", "tel", "search", "email", "url"]);
+
+export class InteractionController {
+  constructor({ mode = "computer", threshold = 8 } = {}) {
+    this.gesture = new TouchGesture(threshold);
+    this.requestSequence = 0;
+    this.activePointerId = null;
+    this.hitTest = null;
+    this.mode = INTERACTION_MODES.has(mode) ? mode : "computer";
+  }
+
+  setMode(mode) {
+    if (!INTERACTION_MODES.has(mode)) throw new TypeError("Unsupported interaction mode");
+    if (mode === this.mode) return false;
+    this.cancel();
+    this.mode = mode;
+    return true;
+  }
+
+  start(pointerId, point) {
+    this.cancel();
+    this.activePointerId = pointerId;
+    if (this.mode === "computer") return { kind: "mouse", event: "mousePressed", point: { ...point } };
+
+    this.gesture.start(point);
+    const requestId = ++this.requestSequence;
+    this.hitTest = { requestId, keyboard: null };
+    return { kind: "touch-start", requestId, point: { ...point } };
+  }
+
+  resolveHitTest({ requestId, editable, inputMode }) {
+    if (!this.hitTest || Number(requestId) !== this.hitTest.requestId) return false;
+    this.hitTest.keyboard = editable
+      ? { inputMode: INPUT_MODES.has(inputMode) ? inputMode : "text" }
+      : null;
+    return true;
+  }
+
+  move(pointerId, point) {
+    if (pointerId !== this.activePointerId) return null;
+    if (this.mode === "computer") return { kind: "mouse", event: "mouseMoved", point: { ...point } };
+
+    const delta = this.gesture.move(point);
+    if (!delta.deltaX && !delta.deltaY) return null;
+    return { kind: "scroll", point: { ...point }, ...delta };
+  }
+
+  end(pointerId, point) {
+    if (pointerId !== this.activePointerId) return null;
+    if (this.mode === "computer") {
+      this.activePointerId = null;
+      return { kind: "mouse", event: "mouseReleased", point: { ...point } };
+    }
+
+    const result = this.gesture.end(point);
+    const keyboard = this.hitTest?.keyboard || null;
+    this.activePointerId = null;
+    this.hitTest = null;
+    if (result.click) return { kind: "tap", point: { ...point }, keyboard };
+    return { kind: "touch-end" };
+  }
+
+  cancel(pointerId) {
+    if (pointerId !== undefined && pointerId !== this.activePointerId) return false;
+    const wasActive = this.activePointerId !== null;
+    this.gesture.cancel();
+    this.activePointerId = null;
+    this.hitTest = null;
+    return wasActive;
+  }
+}
+
 export function normalizeWheel(event, pageHeight) {
   const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? pageHeight : 1;
   return { deltaX: event.deltaX * scale, deltaY: event.deltaY * scale };

@@ -1,0 +1,18 @@
+{
+  "host": "0.0.0.0",
+  "port": 7798,
+  "tokens": [],
+  "startUrl": "https://www.bing.com/",
+  "maxSessions": 4,
+  "idleMinutes": 20,
+  "audio": true,
+  "frame": {
+    "width": 1440,
+    "height": 900,
+    "quality": 72
+  },
+  "browserPath": "",
+  "proxy": "",
+  "noSandbox": false,
+  "allowPrivate": false
+}

@@ -1,6 +1,6 @@
 {
   "name": "lan-browser",
-  "version": "0.3.2",
+  "version": "0.4.0-beta.1",
   "private": true,
   "description": "Windows server-side virtual browser streamed over WebRTC",
   "type": "module",
@@ -9,7 +9,6 @@
     "start": "node src/server.js",
     "test": "node --test",
     "smoke:webrtc": "node scripts/smoke-webrtc.mjs",
-    "smoke:audio": "node scripts/audio-smoke.mjs",
     "bundle": "node scripts/bundle.mjs",
     "build:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-exe.ps1"
   },

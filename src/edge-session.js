@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CdpConnection } from "./cdp.js";
 import { normalizeNavigation } from "./url-policy.js";
+import { normalizeZoom, zoomFactor } from "../public/zoom.js";
 
 const EDGE_LOCATIONS = [
   process.env.PROGRAMFILES && join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
@@ -40,6 +41,77 @@ const waitForDevTools = async (file, timeoutMs = 5_000) => {
   throw new Error("等待 Edge 调试端口超时");
 };
 
+const AUDIO_BINDING = "__lanBrowserAudio";
+const AUDIO_CAPTURE_SCRIPT = `(() => {
+  if (window.__lanBrowserStartAudio) return;
+  const send = (message) => window.${AUDIO_BINDING}(JSON.stringify(message));
+  window.__lanBrowserStopAudio = async () => {
+    const state = window.__lanBrowserAudioState;
+    window.__lanBrowserAudioState = null;
+    if (!state) return;
+    state.processor.onaudioprocess = null;
+    state.processor.disconnect();
+    state.source.disconnect();
+    for (const track of state.stream.getTracks()) track.stop();
+    await state.context.close();
+  };
+  window.__lanBrowserStartAudio = async () => {
+    await window.__lanBrowserStopAudio();
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: { suppressLocalAudioPlayback: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    for (const track of stream.getVideoTracks()) track.stop();
+    if (!stream.getAudioTracks().length) throw new Error("浏览器未提供标签页音轨");
+    const context = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
+    const source = context.createMediaStreamSource(stream);
+    const channels = 2;
+    const processor = context.createScriptProcessor(2048, channels, channels);
+    const silent = context.createGain();
+    silent.gain.value = 0;
+    let quietBlocks = 0;
+    let silenceReported = false;
+    processor.onaudioprocess = (event) => {
+      const input = event.inputBuffer;
+      const channelCount = Math.max(1, Math.min(2, input.numberOfChannels));
+      const frames = input.length;
+      const bytes = new Uint8Array(frames * channelCount * 4);
+      const view = new DataView(bytes.buffer);
+      const channelData = Array.from({ length: channelCount }, (_, index) => input.getChannelData(index));
+      let peak = 0;
+      for (let frame = 0; frame < frames; frame += 1) {
+        for (let channel = 0; channel < channelCount; channel += 1) {
+          const sample = channelData[channel][frame];
+          peak = Math.max(peak, Math.abs(sample));
+          view.setFloat32((frame * channelCount + channel) * 4, sample, true);
+        }
+      }
+      if (peak < 0.0001) {
+        quietBlocks += 1;
+        if (quietBlocks >= 3 && !silenceReported) {
+          silenceReported = true;
+          send({ type: "reset" });
+        }
+        if (silenceReported) return;
+      } else {
+        quietBlocks = 0;
+        silenceReported = false;
+      }
+      let binary = "";
+      for (let offset = 0; offset < bytes.length; offset += 8192) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+      }
+      send({ type: "data", data: btoa(binary) });
+    };
+    source.connect(processor);
+    processor.connect(silent);
+    silent.connect(context.destination);
+    await context.resume();
+    window.__lanBrowserAudioState = { context, source, processor, stream };
+    return true;
+  };
+})()`;
+
 export class EdgeSession {
   constructor(config, callbacks = {}) {
     this.config = config;
@@ -51,12 +123,16 @@ export class EdgeSession {
     this.closed = false;
     this.width = config.frameWidth;
     this.height = config.frameHeight;
+    this.zoom = 100;
     this.framePending = false;
     this.lastActivity = Date.now();
     this.browserError = "";
     this.targets = [];
     this.targetIndex = -1;
     this.targetSwitch = Promise.resolve();
+    this.captureSessionId = null;
+    this.captureTitle = `VIRTUAL_BROWSER_AUDIO_${randomUUID()}`;
+    this.audioReady = false;
   }
 
   async start() {
@@ -74,6 +150,8 @@ export class EdgeSession {
       "--disable-sync",
       "--no-first-run",
       "--no-default-browser-check",
+      "--autoplay-policy=no-user-gesture-required",
+      `--auto-select-tab-capture-source-by-title=${this.captureTitle}`,
       "--disable-features=Translate,OptimizationHints,MediaRouter",
       "--remote-debugging-port=0",
     ];
@@ -144,12 +222,31 @@ export class EdgeSession {
       this.targets.splice(index, 1);
       if (index < this.targetIndex) this.targetIndex -= 1;
     });
+    this.cdp.on("Runtime.bindingCalled", ({ name, payload }, sessionId) => {
+      if (name !== AUDIO_BINDING || sessionId !== this.captureSessionId) return;
+      try {
+        const message = JSON.parse(payload);
+        if (message.type === "data" && typeof message.data === "string") {
+          this.callbacks.onAudioData?.(Buffer.from(message.data, "base64"));
+        } else if (message.type === "reset") this.callbacks.onAudioReset?.();
+      } catch (error) {
+        this.callbacks.onAudioError?.(error);
+      }
+    });
     await step("监听新标签页", this.cdp.send("Target.setDiscoverTargets", { discover: true }));
 
     await step("启用页面", this.cdp.send("Page.enable", {}, this.sessionId));
     await step("启用脚本环境", this.cdp.send("Runtime.enable", {}, this.sessionId));
     await step("设置画面尺寸", this.resize(this.width, this.height));
     await step("启动画面流", this.#startScreencast(this.sessionId));
+    if (this.config.audio) {
+      try {
+        await this.#initializeAudioCapture();
+        this.audioReady = true;
+      } catch (error) {
+        this.callbacks.onAudioError?.(new Error(`启动标签页音频失败: ${error.message}`));
+      }
+    }
     try {
       await this.navigate(this.config.startUrl);
     } catch (error) {
@@ -165,6 +262,8 @@ export class EdgeSession {
       case "forward": return this.#history(1);
       case "reload": return this.cdp.send("Page.reload", { ignoreCache: false }, this.sessionId);
       case "resize": return this.resize(message.width, message.height);
+      case "zoom": return this.setZoom(message.percent);
+      case "hitTest": return this.#hitTest(message);
       case "mouse": return this.#mouse(message);
       case "wheel": return this.#wheel(message);
       case "key": return this.#key(message);
@@ -184,12 +283,23 @@ export class EdgeSession {
   async resize(width, height) {
     this.width = Math.round(Math.min(3840, Math.max(320, Number(width) || this.width)));
     this.height = Math.round(Math.min(2160, Math.max(240, Number(height) || this.height)));
-    await this.cdp.send("Emulation.setDeviceMetricsOverride", {
-      width: this.width,
-      height: this.height,
-      deviceScaleFactor: 1,
+    await this.#applyMetrics(this.sessionId);
+  }
+
+  async setZoom(percent) {
+    this.zoom = normalizeZoom(percent, this.zoom);
+    await this.#applyMetrics(this.sessionId);
+    this.callbacks.onState?.({ type: "zoom", percent: this.zoom });
+  }
+
+  #applyMetrics(sessionId) {
+    const factor = zoomFactor(this.zoom);
+    return this.cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: Math.max(1, Math.round(this.width / factor)),
+      height: Math.max(1, Math.round(this.height / factor)),
+      deviceScaleFactor: factor,
       mobile: false,
-    }, this.sessionId);
+    }, sessionId);
   }
 
   async close() {
@@ -201,13 +311,56 @@ export class EdgeSession {
     if (this.profileDir) await rm(this.profileDir, { recursive: true, force: true, maxRetries: 3 }).catch(() => {});
   }
 
+  async #initializeAudioCapture() {
+    await this.#markCaptureTarget();
+    const capture = await this.cdp.send("Target.createTarget", {
+      url: this.config.captureUrl,
+      background: true,
+    });
+    const attached = await this.cdp.send("Target.attachToTarget", { targetId: capture.targetId, flatten: true });
+    this.captureSessionId = attached.sessionId;
+    await this.cdp.send("Runtime.enable", {}, this.captureSessionId);
+    await this.cdp.send("Runtime.addBinding", { name: AUDIO_BINDING }, this.captureSessionId);
+    await this.cdp.send("Runtime.evaluate", { expression: AUDIO_CAPTURE_SCRIPT }, this.captureSessionId);
+    await this.#restartAudioCapture();
+    const target = this.targets[this.targetIndex];
+    if (target) await this.cdp.send("Target.activateTarget", { targetId: target.targetId });
+    await this.cdp.send("Page.stopScreencast", {}, this.sessionId).catch(() => {});
+    await this.#startScreencast(this.sessionId);
+  }
+
+  async #markCaptureTarget() {
+    const result = await this.cdp.send("Runtime.evaluate", {
+      expression: `(window.__lanBrowserOriginalTitle ??= document.title, document.title=${JSON.stringify(this.captureTitle)}, true)`,
+      returnByValue: true,
+    }, this.sessionId);
+    return result.result?.value;
+  }
+
+  async #restartAudioCapture() {
+    if (!this.captureSessionId) return;
+    await this.#markCaptureTarget();
+    try {
+      const result = await this.cdp.send("Runtime.evaluate", {
+        expression: "window.__lanBrowserStartAudio()",
+        awaitPromise: true,
+        returnByValue: true,
+      }, this.captureSessionId, 20_000);
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "标签页音频捕获失败");
+    } finally {
+      await this.cdp.send("Runtime.evaluate", {
+        expression: "if (window.__lanBrowserOriginalTitle !== undefined) { document.title = window.__lanBrowserOriginalTitle; delete window.__lanBrowserOriginalTitle; }",
+      }, this.sessionId).catch(() => {});
+    }
+  }
+
   async #mouse(message) {
     const allowed = new Set(["mousePressed", "mouseReleased", "mouseMoved"]);
     if (!allowed.has(message.event)) throw new Error("无效的鼠标事件");
     const result = await this.cdp.send("Input.dispatchMouseEvent", {
       type: message.event,
-      x: Math.max(0, Math.min(this.width, Number(message.x) || 0)),
-      y: Math.max(0, Math.min(this.height, Number(message.y) || 0)),
+      x: this.#cssCoordinate(message.x, this.width),
+      y: this.#cssCoordinate(message.y, this.height),
       button: ["left", "middle", "right"].includes(message.button) ? message.button : "none",
       buttons: Number(message.buttons) || 0,
       clickCount: Math.min(3, Math.max(0, Number(message.clickCount) || 0)),
@@ -217,15 +370,46 @@ export class EdgeSession {
     return result;
   }
 
+  async #hitTest(message) {
+    const requestId = Math.max(0, Math.round(Number(message.requestId) || 0));
+    const x = this.#cssCoordinate(message.x, this.width);
+    const y = this.#cssCoordinate(message.y, this.height);
+    const result = await this.cdp.send("Runtime.evaluate", {
+      expression: `(() => {
+        let element = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+        while (element?.shadowRoot) element = element.shadowRoot.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)}) || element;
+        const labelControl = element?.closest?.("label")?.control;
+        element = labelControl || element?.closest?.("input, textarea, [contenteditable]") || element;
+        if (!element || element.disabled || element.readOnly) return { editable: false };
+        const tag = element.tagName;
+        const blocked = new Set(["button", "checkbox", "radio", "range", "color", "file", "submit", "reset", "image", "hidden"]);
+        const inputType = tag === "INPUT" ? String(element.type || "text").toLowerCase() : "";
+        const editable = tag === "TEXTAREA" || element.isContentEditable || (tag === "INPUT" && !blocked.has(inputType));
+        return {
+          editable,
+          inputMode: editable ? (element.inputMode || (inputType === "number" ? "decimal" : "text")) : "text",
+        };
+      })()`,
+      returnByValue: true,
+    }, this.sessionId);
+    this.callbacks.onState?.({ type: "hit-test", requestId, ...(result.result?.value || { editable: false }) });
+  }
+
   #wheel(message) {
+    const factor = zoomFactor(this.zoom);
     return this.cdp.send("Input.dispatchMouseEvent", {
       type: "mouseWheel",
-      x: Math.max(0, Math.min(this.width, Number(message.x) || 0)),
-      y: Math.max(0, Math.min(this.height, Number(message.y) || 0)),
-      deltaX: Math.max(-1200, Math.min(1200, Number(message.deltaX) || 0)),
-      deltaY: Math.max(-1200, Math.min(1200, Number(message.deltaY) || 0)),
+      x: this.#cssCoordinate(message.x, this.width),
+      y: this.#cssCoordinate(message.y, this.height),
+      deltaX: Math.max(-1200, Math.min(1200, (Number(message.deltaX) || 0) / factor)),
+      deltaY: Math.max(-1200, Math.min(1200, (Number(message.deltaY) || 0) / factor)),
       modifiers: Number(message.modifiers) || 0,
     }, this.sessionId);
+  }
+
+  #cssCoordinate(value, maximum) {
+    const pixels = Math.max(0, Math.min(maximum, Number(value) || 0));
+    return pixels / zoomFactor(this.zoom);
   }
 
   #key(message) {
@@ -286,14 +470,10 @@ export class EdgeSession {
       await this.cdp.send("Page.enable", {}, this.sessionId);
       await this.cdp.send("Runtime.enable", {}, this.sessionId);
     }
-    await this.cdp.send("Page.bringToFront", {}, this.sessionId).catch(() => {});
-    await this.cdp.send("Emulation.setDeviceMetricsOverride", {
-      width: this.width,
-      height: this.height,
-      deviceScaleFactor: 1,
-      mobile: false,
-    }, this.sessionId);
+    await this.cdp.send("Target.activateTarget", { targetId: target.targetId }).catch(() => {});
+    await this.#applyMetrics(this.sessionId);
     await this.#startScreencast(this.sessionId);
+    if (this.audioReady) await this.#restartAudioCapture();
     await this.#emitPageState();
   }
 

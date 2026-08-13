@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { networkInterfaces } from "node:os";
+import { accessUrl, terminalLink } from "./terminal-link.js";
 import { WebSocketServer } from "ws";
 import { loadConfig } from "./config.js";
 import { SessionManager } from "./session-manager.js";
@@ -8,6 +9,14 @@ import { assets } from "./generated-assets.js";
 
 const config = loadConfig();
 const sessions = new SessionManager(config);
+const captureServer = createServer((_req, res) => {
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'none'",
+  });
+  res.end(assets["/capture.html"]);
+});
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -87,6 +96,7 @@ wss.on("connection", (ws) => {
 
 const shutdown = async () => {
   server.close();
+  captureServer.close();
   wss.close();
   await sessions.close();
   process.exit(0);
@@ -94,11 +104,14 @@ const shutdown = async () => {
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
-server.listen(config.port, config.host, () => {
+captureServer.listen(0, "127.0.0.1", () => {
+  config.captureUrl = `http://127.0.0.1:${captureServer.address().port}/`;
+  server.listen(config.port, config.host, () => {
   const addresses = Object.values(networkInterfaces()).flat().filter((item) => item?.family === "IPv4" && !item.internal);
   console.log("\n  LAN Browser 已启动\n");
   if (config.configPath) console.log(`  配置: ${config.configPath}`);
-  console.log(`  本机: http://127.0.0.1:${config.port}/?token=${config.token}`);
-  for (const address of addresses) console.log(`  内网: http://${address.address}:${config.port}/?token=${config.token}`);
+  console.log(`  本机: ${terminalLink(accessUrl("127.0.0.1", config.port, config.token))}`);
+  for (const address of addresses) console.log(`  内网: ${terminalLink(accessUrl(address.address, config.port, config.token))}`);
   console.log("\n  请妥善保管访问口令；按 Ctrl+C 停止服务。\n");
+  });
 });

@@ -1,7 +1,6 @@
 import { RTCPeerConnection } from "werift";
 import { EdgeSession } from "./edge-session.js";
 import { encodeFrame } from "../public/stream.js";
-import { WindowsAudioCapture } from "./audio-capture.js";
 
 const MAX_CONTROL_MESSAGE = 16 * 1024;
 const MAX_FRAME_BUFFER = 2 * 1024 * 1024;
@@ -20,8 +19,6 @@ export class WebRtcBrowserSession {
     this.control = null;
     this.frames = null;
     this.audioChannel = null;
-    this.audioCapture = null;
-    this.audioFormat = null;
     this.closed = false;
     this.browserReady = false;
     this.disconnectTimer = null;
@@ -57,7 +54,6 @@ export class WebRtcBrowserSession {
     this.control?.close();
     this.frames?.close();
     this.audioChannel?.close();
-    this.audioCapture?.close();
     await Promise.allSettled([this.edge?.close(), this.peer.close()]);
     this.callbacks.onClose?.();
   }
@@ -80,7 +76,7 @@ export class WebRtcBrowserSession {
       this.audioChannel = channel;
       channel.bufferedAmountLowThreshold = 128 * 1024;
       channel.stateChanged.subscribe((state) => {
-        if (state === "open") this.#maybeStartAudio();
+        if (state === "open") this.#maybeStartBrowser();
       });
     } else {
       channel.close();
@@ -89,16 +85,22 @@ export class WebRtcBrowserSession {
 
   async #maybeStartBrowser() {
     if (this.edge || this.closed || this.control?.readyState !== "open" || this.frames?.readyState !== "open") return;
+    if (this.config.audio && this.audioChannel?.readyState !== "open") return;
     this.edge = new EdgeSession(this.config, {
       onFrame: (frame) => this.#sendFrame(frame),
       onState: (state) => this.#sendControl(state),
+      onAudioData: (data) => this.#sendAudio(data),
+      onAudioReset: () => this.#sendAudioReset(),
+      onAudioError: (error) => this.#sendControl({ type: "audio-error", message: error.message || "音频采集不可用" }),
     });
     this.#sendControl({ type: "status", state: "starting", message: "正在启动服务端浏览器" });
     try {
       await this.edge.start();
       this.browserReady = true;
       this.#sendControl({ type: "status", state: "ready", message: "已连接" });
-      await this.#maybeStartAudio();
+      if (this.edge.audioReady) {
+        this.#sendControl({ type: "audio-format", sampleRate: 48000, channels: 2, bitsPerSample: 32, encoding: "float" });
+      }
     } catch (error) {
       this.#sendControl({ type: "error", message: error.message || "浏览器启动失败" });
       await this.close();
@@ -133,23 +135,12 @@ export class WebRtcBrowserSession {
     this.frames.send(encodeFrame(this.frameSequence, frame));
   }
 
-  async #maybeStartAudio() {
-    if (!this.config.audio || this.audioCapture || !this.edge || this.audioChannel?.readyState !== "open") return;
-    this.audioCapture = new WindowsAudioCapture(this.config, {
-      onFormat: (format) => {
-        this.audioFormat = format;
-        this.#sendControl({ type: "audio-format", ...format });
-      },
-      onData: (data) => {
-        if (this.audioChannel?.readyState !== "open" || this.audioChannel.bufferedAmount > MAX_AUDIO_BUFFER) return;
-        this.audioChannel.send(data);
-      },
-      onError: (error) => this.#sendControl({ type: "audio-error", message: error.message || "音频采集不可用" }),
-    });
-    try {
-      await this.audioCapture.start();
-    } catch (error) {
-      this.#sendControl({ type: "audio-error", message: error.message || "音频采集不可用" });
-    }
+  #sendAudio(data) {
+    if (this.audioChannel?.readyState !== "open" || this.audioChannel.bufferedAmount > MAX_AUDIO_BUFFER) return;
+    this.audioChannel.send(data);
+  }
+
+  #sendAudioReset() {
+    if (this.audioChannel?.readyState === "open") this.audioChannel.send("reset");
   }
 }

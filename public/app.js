@@ -1,6 +1,7 @@
-import { TouchGesture, TouchScrollBuffer, normalizeWheel } from "/input.js?v=0.3.0";
+import { InteractionController, TouchScrollBuffer, normalizeWheel } from "/input.js?v=0.3.3";
 import { SequencedFrameReader } from "/stream.js?v=0.3.0";
 import { AudioPlaybackQueue, decodePcm } from "/audio.js?v=0.3.2";
+import { nextZoom, normalizeZoom } from "/zoom.js?v=0.3.4";
 
 /* global lucide */
 lucide.createIcons();
@@ -12,14 +13,19 @@ const elements = {
   error: $("#connect-error"), addressForm: $("#address-form"), address: $("#address"),
   back: $("#back"), forward: $("#forward"), reload: $("#reload"), disconnect: $("#disconnect"),
   audioToggle: $("#audio-toggle"),
+  interactionMode: $("#interaction-mode"),
   mobileKeyboard: $("#mobile-keyboard"), mobileInput: $("#mobile-input"),
   displaySettings: $("#display-settings"), displayPanel: $("#display-panel"), resolutionForm: $("#resolution-form"),
   autoResolution: $("#auto-resolution"), resolutionWidth: $("#resolution-width"), resolutionHeight: $("#resolution-height"),
+  zoomOut: $("#zoom-out"), zoomPercent: $("#zoom-percent"), zoomIn: $("#zoom-in"), zoomReset: $("#zoom-reset"),
   statusChip: $("#status-chip"), statusText: $("#status-text"), resolution: $("#resolution"), toast: $("#toast"),
 };
 
-const state = { peer: null, signal: null, control: null, frames: null, audio: null, audioContext: null, audioGain: null, audioQueue: null, audioFormat: null, audioMuted: false, frameUrl: "", pendingFrameUrl: "", connected: false, moving: false, resizeTimer: null, touchScrollRaf: 0, autoResolution: true };
+const state = { peer: null, signal: null, control: null, frames: null, audio: null, audioContext: null, audioGain: null, audioQueue: null, audioFormat: null, audioMuted: false, frameUrl: "", pendingFrameUrl: "", connected: false, moving: false, resizeTimer: null, touchScrollRaf: 0, autoResolution: true, zoom: normalizeZoom(localStorage.getItem("lan-browser-zoom") || 100) };
 const frameReader = new SequencedFrameReader();
+const storedInteractionMode = localStorage.getItem("lan-browser-interaction-mode");
+const defaultInteractionMode = storedInteractionMode || (matchMedia("(pointer: coarse)").matches ? "touch" : "computer");
+const interaction = new InteractionController({ mode: defaultInteractionMode });
 const queryToken = new URLSearchParams(location.search).get("token") || sessionStorage.getItem("lan-browser-token") || "";
 elements.token.value = queryToken;
 
@@ -32,7 +38,8 @@ function setRemoteEnabled(enabled) {
   state.connected = enabled;
   elements.viewport.classList.toggle("remote-active", enabled);
   elements.empty.hidden = enabled;
-  for (const element of [elements.address, elements.back, elements.forward, elements.reload, elements.disconnect, elements.audioToggle, elements.displaySettings, elements.mobileKeyboard, $(".go-button")]) element.disabled = !enabled;
+  for (const element of [elements.address, elements.back, elements.forward, elements.reload, elements.disconnect, elements.audioToggle, elements.displaySettings, elements.interactionMode, elements.mobileKeyboard, elements.zoomPercent, elements.zoomReset, $(".go-button")]) element.disabled = !enabled;
+  updateZoomControls();
   if (enabled) elements.viewport.focus();
 }
 
@@ -94,6 +101,7 @@ async function connect(token) {
       setStatus("connecting", "启动中");
       elements.loadingText.textContent = "正在启动服务端 Edge";
       sendResize();
+      updateZoom(state.zoom);
     };
     peer.onconnectionstatechange = () => {
       if (["failed", "disconnected", "closed"].includes(peer.connectionState)) disconnect(true, "WebRTC 连接已断开");
@@ -182,6 +190,10 @@ function onControl(message) {
     } else if (document.activeElement === elements.mobileInput) {
       elements.mobileInput.blur();
     }
+  } else if (message.type === "zoom") {
+    updateZoom(message.percent, false);
+  } else if (message.type === "hit-test") {
+    interaction.resolveHitTest(message);
   } else if (message.type === "audio-format") {
     state.audioFormat = message;
   } else if (message.type === "audio-error") {
@@ -192,6 +204,10 @@ function onControl(message) {
 function onAudio(data) {
   const context = state.audioContext;
   if (!context || !state.audioGain || !state.audioFormat || context.state === "closed") return;
+  if (data === "reset") {
+    state.audioQueue?.close();
+    return;
+  }
   const channels = decodePcm(data, state.audioFormat);
   if (!channels.length || !channels[0].length) return;
   const buffer = context.createBuffer(channels.length, channels[0].length, state.audioFormat.sampleRate);
@@ -225,6 +241,23 @@ function send(message) {
   if (state.control?.readyState === "open") state.control.send(JSON.stringify(message));
 }
 
+function updateZoom(value, transmit = true) {
+  state.zoom = normalizeZoom(value, state.zoom);
+  elements.zoomPercent.value = String(state.zoom);
+  localStorage.setItem("lan-browser-zoom", String(state.zoom));
+  updateZoomControls();
+  if (transmit) send({ type: "zoom", percent: state.zoom });
+}
+
+function updateZoomControls() {
+  const enabled = state.connected;
+  elements.zoomOut.disabled = !enabled || state.zoom <= 25;
+  elements.zoomIn.disabled = !enabled || state.zoom >= 500;
+  elements.zoomReset.disabled = !enabled || state.zoom === 100;
+}
+
+elements.zoomPercent.value = String(state.zoom);
+
 function modifiers(event) {
   return (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0);
 }
@@ -243,9 +276,7 @@ function remotePoint(event) {
 }
 
 const buttonName = (button) => ["left", "middle", "right"][button] || "none";
-const touchGesture = new TouchGesture(8);
 const touchScroll = new TouchScrollBuffer();
-let touchPointerId = null;
 let lastTap = { time: 0, x: 0, y: 0 };
 
 function sendClick(point, clickCount = 1) {
@@ -264,14 +295,50 @@ function queueTouchScroll(point, delta) {
   if (!state.touchScrollRaf) state.touchScrollRaf = requestAnimationFrame(flushTouchScroll);
 }
 
+function sendTouchMouse(action) {
+  send({
+    type: "mouse",
+    event: action.event,
+    ...action.point,
+    button: action.event === "mouseMoved" ? "none" : "left",
+    buttons: action.event === "mouseReleased" ? 0 : 1,
+    clickCount: action.event === "mouseMoved" ? 0 : 1,
+    modifiers: 0,
+  });
+}
+
+function setInteractionMode(mode, remember = true) {
+  interaction.setMode(mode);
+  touchScroll.clear();
+  if (state.touchScrollRaf) cancelAnimationFrame(state.touchScrollRaf);
+  state.touchScrollRaf = 0;
+  elements.mobileInput.blur();
+  elements.viewport.dataset.interactionMode = interaction.mode;
+  const isTouch = interaction.mode === "touch";
+  const nextMode = isTouch ? "电脑操作" : "触屏操作";
+  elements.interactionMode.title = `${isTouch ? "触屏操作" : "电脑操作"}（点击切换为${nextMode}）`;
+  elements.interactionMode.setAttribute("aria-label", `切换为${nextMode}`);
+  elements.interactionMode.setAttribute("aria-pressed", String(isTouch));
+  const current = elements.interactionMode.querySelector("svg, i");
+  const icon = document.createElement("i");
+  icon.dataset.lucide = isTouch ? "hand" : "mouse-pointer-2";
+  current?.replaceWith(icon);
+  lucide.createIcons();
+  if (remember) localStorage.setItem("lan-browser-interaction-mode", interaction.mode);
+}
+
+setInteractionMode(interaction.mode, false);
+
 elements.viewport.addEventListener("pointerdown", (event) => {
   if (!state.connected) return;
   elements.viewport.focus();
   elements.viewport.setPointerCapture(event.pointerId);
   const point = remotePoint(event);
   if (event.pointerType === "touch") {
-    touchPointerId = event.pointerId;
-    touchGesture.start(point);
+    if (interaction.activePointerId !== null) return;
+    const action = interaction.start(event.pointerId, point);
+    if (action.kind === "touch-start") send({ type: "hitTest", requestId: action.requestId, ...point });
+    else sendTouchMouse(action);
     event.preventDefault();
     return;
   }
@@ -281,18 +348,21 @@ elements.viewport.addEventListener("pointerdown", (event) => {
 elements.viewport.addEventListener("pointerup", (event) => {
   if (!state.connected) return;
   const point = remotePoint(event);
-  if (event.pointerType === "touch" && event.pointerId === touchPointerId) {
-    const result = touchGesture.end(point);
-    if (result.click) {
+  if (event.pointerType === "touch") {
+    const action = interaction.end(event.pointerId, point);
+    if (!action) return;
+    if (action.kind === "tap") {
       const now = performance.now();
       const doubleTap = now - lastTap.time < 350 && Math.hypot(point.x - lastTap.x, point.y - lastTap.y) < 24;
       sendClick(point, doubleTap ? 2 : 1);
-      elements.mobileInput.focus({ preventScroll: true });
+      if (action.keyboard) {
+        elements.mobileInput.inputMode = action.keyboard.inputMode;
+        elements.mobileInput.focus({ preventScroll: true });
+      }
       lastTap = { time: now, ...point };
-    } else {
+    } else if (action.kind === "touch-end") {
       flushTouchScroll();
-    }
-    touchPointerId = null;
+    } else sendTouchMouse(action);
     event.preventDefault();
     return;
   }
@@ -301,10 +371,12 @@ elements.viewport.addEventListener("pointerup", (event) => {
 });
 elements.viewport.addEventListener("pointermove", (event) => {
   if (!state.connected) return;
-  if (event.pointerType === "touch" && event.pointerId === touchPointerId) {
+  if (event.pointerType === "touch") {
     const point = remotePoint(event);
-    const delta = touchGesture.move(point);
-    if (delta.deltaX || delta.deltaY) queueTouchScroll(point, delta);
+    const action = interaction.move(event.pointerId, point);
+    if (!action) return;
+    if (action.kind === "scroll") queueTouchScroll(action.point, action);
+    else sendTouchMouse(action);
     event.preventDefault();
     return;
   }
@@ -317,14 +389,19 @@ elements.viewport.addEventListener("pointermove", (event) => {
   });
 });
 elements.viewport.addEventListener("pointercancel", (event) => {
-  if (event.pointerId === touchPointerId) {
-    touchGesture.cancel();
+  if (event.pointerType === "touch" && event.pointerId === interaction.activePointerId) {
+    if (interaction.mode === "computer") sendTouchMouse({ kind: "mouse", event: "mouseReleased", point: remotePoint(event) });
+    interaction.cancel(event.pointerId);
     touchScroll.clear();
-    touchPointerId = null;
   }
 });
 elements.viewport.addEventListener("wheel", (event) => {
   if (!state.connected) return;
+  if (event.ctrlKey) {
+    updateZoom(nextZoom(state.zoom, event.deltaY < 0 ? 1 : -1));
+    event.preventDefault();
+    return;
+  }
   const point = remotePoint(event);
   const delta = normalizeWheel(event, elements.viewport.clientHeight);
   send({ type: "wheel", ...point, ...delta, modifiers: modifiers(event) });
@@ -336,6 +413,13 @@ for (const type of ["keydown", "keyup"]) {
   elements.viewport.addEventListener(type, (event) => {
     if (!state.connected) return;
     if (event.isComposing || event.keyCode === 229) return;
+    const zoomDirection = ["+", "="].includes(event.key) ? 1 : ["-", "_"].includes(event.key) ? -1 : 0;
+    const zoomShortcut = event.ctrlKey && !event.altKey && !event.metaKey && (zoomDirection || event.key === "0");
+    if (zoomShortcut) {
+      if (type === "keydown" && !event.repeat) updateZoom(event.key === "0" ? 100 : nextZoom(state.zoom, zoomDirection));
+      event.preventDefault();
+      return;
+    }
     send({ type: "key", event: type === "keydown" ? "down" : "up", key: event.key, code: event.code, keyCode: event.keyCode, repeat: event.repeat, modifiers: modifiers(event), ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey });
     event.preventDefault();
   });
@@ -370,7 +454,23 @@ elements.audioToggle.addEventListener("click", () => {
   current?.replaceWith(icon);
   lucide.createIcons();
 });
+elements.interactionMode.addEventListener("click", () => {
+  const nextMode = interaction.mode === "touch" ? "computer" : "touch";
+  setInteractionMode(nextMode);
+  showToast(nextMode === "touch" ? "已切换为触屏操作" : "已切换为电脑操作");
+});
 elements.mobileKeyboard.addEventListener("click", () => elements.mobileInput.focus());
+elements.zoomOut.addEventListener("click", () => updateZoom(nextZoom(state.zoom, -1)));
+elements.zoomIn.addEventListener("click", () => updateZoom(nextZoom(state.zoom, 1)));
+elements.zoomReset.addEventListener("click", () => updateZoom(100));
+elements.zoomPercent.addEventListener("change", () => updateZoom(elements.zoomPercent.value));
+elements.zoomPercent.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    updateZoom(elements.zoomPercent.value);
+    elements.zoomPercent.select();
+  }
+});
 elements.displaySettings.addEventListener("click", () => {
   const opening = elements.displayPanel.hidden;
   if (opening && state.autoResolution && elements.frame.naturalWidth) {
