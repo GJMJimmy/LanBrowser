@@ -125,6 +125,8 @@ export class EdgeSession {
     this.height = config.frameHeight;
     this.zoom = 100;
     this.framePending = false;
+    this.frameGeneration = 0;
+    this.screencastUpdate = Promise.resolve();
     this.lastActivity = Date.now();
     this.browserError = "";
     this.targets = [];
@@ -191,7 +193,7 @@ export class EdgeSession {
     const { targetId } = await step("创建页面", this.cdp.send("Target.createTarget", { url: "about:blank" }));
     const attached = await step("附加页面", this.cdp.send("Target.attachToTarget", { targetId, flatten: true }));
     this.sessionId = attached.sessionId;
-    this.targets.push({ targetId, sessionId: attached.sessionId });
+    this.targets.push({ targetId, sessionId: attached.sessionId, title: "新标签页", url: "about:blank" });
     this.targetIndex = 0;
 
     this.cdp.on("Page.screencastFrame", (params, sessionId) => {
@@ -199,12 +201,17 @@ export class EdgeSession {
       if (sessionId !== this.sessionId) return;
       if (!this.framePending) {
         this.framePending = true;
-        Promise.resolve(this.callbacks.onFrame?.(Buffer.from(params.data, "base64")))
+        Promise.resolve(this.callbacks.onFrame?.(Buffer.from(params.data, "base64"), this.frameGeneration))
           .finally(() => { this.framePending = false; });
       }
     });
     this.cdp.on("Page.frameNavigated", (params, sessionId) => {
-      if (sessionId === this.sessionId && !params.frame.parentId) this.#emitPageState();
+      if (sessionId === this.sessionId && !params.frame.parentId) {
+        this.#restartScreencast(sessionId).catch((error) => {
+          this.callbacks.onState?.({ type: "error", message: `更新页面画面失败: ${error.message}` });
+        });
+        this.#emitPageState();
+      }
     });
     this.cdp.on("Page.loadEventFired", (_params, sessionId) => {
       if (sessionId === this.sessionId) this.#emitPageState();
@@ -219,8 +226,15 @@ export class EdgeSession {
     this.cdp.on("Target.targetDestroyed", ({ targetId: destroyedId }) => {
       const index = this.targets.findIndex((target) => target.targetId === destroyedId);
       if (index < 0) return;
+      const wasActive = index === this.targetIndex;
       this.targets.splice(index, 1);
       if (index < this.targetIndex) this.targetIndex -= 1;
+      else if (index === this.targetIndex) this.targetIndex = Math.min(index, this.targets.length - 1);
+      if (wasActive && this.targets.length) {
+        this.targetSwitch = this.targetSwitch
+          .then(() => this.#activateTarget(this.targetIndex))
+          .catch((error) => this.callbacks.onState?.({ type: "error", message: `切换标签页失败: ${error.message}` }));
+      } else this.#emitTabsState();
     });
     this.cdp.on("Runtime.bindingCalled", ({ name, payload }, sessionId) => {
       if (name !== AUDIO_BINDING || sessionId !== this.captureSessionId) return;
@@ -237,8 +251,7 @@ export class EdgeSession {
 
     await step("启用页面", this.cdp.send("Page.enable", {}, this.sessionId));
     await step("启用脚本环境", this.cdp.send("Runtime.enable", {}, this.sessionId));
-    await step("设置画面尺寸", this.resize(this.width, this.height));
-    await step("启动画面流", this.#startScreencast(this.sessionId));
+    await step("启动画面流", this.#restartScreencast(this.sessionId));
     if (this.config.audio) {
       try {
         await this.#initializeAudioCapture();
@@ -261,6 +274,9 @@ export class EdgeSession {
       case "back": return this.#history(-1);
       case "forward": return this.#history(1);
       case "reload": return this.cdp.send("Page.reload", { ignoreCache: false }, this.sessionId);
+      case "tab-new": return this.#newTab(message.url);
+      case "tab-activate": return this.#activateTargetById(message.id);
+      case "tab-close": return this.#closeTab(message.id);
       case "resize": return this.resize(message.width, message.height);
       case "zoom": return this.setZoom(message.percent);
       case "hitTest": return this.#hitTest(message);
@@ -283,12 +299,12 @@ export class EdgeSession {
   async resize(width, height) {
     this.width = Math.round(Math.min(3840, Math.max(320, Number(width) || this.width)));
     this.height = Math.round(Math.min(2160, Math.max(240, Number(height) || this.height)));
-    await this.#applyMetrics(this.sessionId);
+    await this.#restartScreencast(this.sessionId);
   }
 
   async setZoom(percent) {
     this.zoom = normalizeZoom(percent, this.zoom);
-    await this.#applyMetrics(this.sessionId);
+    await this.#restartScreencast(this.sessionId);
     this.callbacks.onState?.({ type: "zoom", percent: this.zoom });
   }
 
@@ -325,8 +341,7 @@ export class EdgeSession {
     await this.#restartAudioCapture();
     const target = this.targets[this.targetIndex];
     if (target) await this.cdp.send("Target.activateTarget", { targetId: target.targetId });
-    await this.cdp.send("Page.stopScreencast", {}, this.sessionId).catch(() => {});
-    await this.#startScreencast(this.sessionId);
+    await this.#restartScreencast(this.sessionId);
   }
 
   async #markCaptureTarget() {
@@ -436,8 +451,6 @@ export class EdgeSession {
     const history = await this.cdp.send("Page.getNavigationHistory", {}, this.sessionId);
     const target = history.entries?.[history.currentIndex + offset];
     if (target) return this.cdp.send("Page.navigateToHistoryEntry", { entryId: target.id }, this.sessionId);
-    const targetIndex = this.targetIndex + offset;
-    if (targetIndex >= 0 && targetIndex < this.targets.length) return this.#activateTarget(targetIndex);
   }
 
   #startScreencast(sessionId) {
@@ -450,11 +463,53 @@ export class EdgeSession {
     }, sessionId);
   }
 
+  #restartScreencast(sessionId) {
+    const update = async () => {
+      if (sessionId !== this.sessionId || this.closed) return;
+      await this.cdp.send("Page.stopScreencast", {}, sessionId).catch(() => {});
+      await this.#applyMetrics(sessionId);
+      if (sessionId !== this.sessionId || this.closed) return;
+      this.frameGeneration = (this.frameGeneration + 1) >>> 0 || 1;
+      await this.#startScreencast(sessionId);
+    };
+    this.screencastUpdate = this.screencastUpdate.then(update, update);
+    return this.screencastUpdate;
+  }
+
   async #attachPopup(targetId) {
     const attached = await this.cdp.send("Target.attachToTarget", { targetId, flatten: true });
     const nextIndex = this.targets.length;
-    this.targets.push({ targetId, sessionId: attached.sessionId });
+    this.targets.push({ targetId, sessionId: attached.sessionId, title: "新标签页", url: "about:blank" });
     await this.#activateTarget(nextIndex, true);
+  }
+
+  async #newTab(input = "about:blank") {
+    const url = input && input !== "about:blank"
+      ? normalizeNavigation(input, { blockPrivate: !this.config.allowPrivate })
+      : "about:blank";
+    const { targetId } = await this.cdp.send("Target.createTarget", { url });
+    const attached = await this.cdp.send("Target.attachToTarget", { targetId, flatten: true });
+    const nextIndex = this.targets.length;
+    this.targets.push({ targetId, sessionId: attached.sessionId, title: "新标签页", url });
+    await this.#activateTarget(nextIndex, true);
+  }
+
+  #activateTargetById(id) {
+    const index = this.targets.findIndex((target) => target.targetId === String(id || ""));
+    if (index < 0) throw new Error("标签页不存在");
+    return this.#activateTarget(index);
+  }
+
+  async #closeTab(id) {
+    if (this.targets.length <= 1) return;
+    const index = this.targets.findIndex((target) => target.targetId === String(id || ""));
+    if (index < 0) throw new Error("标签页不存在");
+    const target = this.targets[index];
+    if (index === this.targetIndex) {
+      const nextIndex = index === this.targets.length - 1 ? index - 1 : index + 1;
+      await this.#activateTarget(nextIndex);
+    }
+    await this.cdp.send("Target.closeTarget", { targetId: target.targetId });
   }
 
   async #activateTarget(index, initialize = false) {
@@ -471,10 +526,10 @@ export class EdgeSession {
       await this.cdp.send("Runtime.enable", {}, this.sessionId);
     }
     await this.cdp.send("Target.activateTarget", { targetId: target.targetId }).catch(() => {});
-    await this.#applyMetrics(this.sessionId);
-    await this.#startScreencast(this.sessionId);
     if (this.audioReady) await this.#restartAudioCapture();
+    await this.#restartScreencast(this.sessionId);
     await this.#emitPageState();
+    this.#emitTabsState();
   }
 
   async #emitPageState() {
@@ -484,8 +539,23 @@ export class EdgeSession {
         returnByValue: true,
       }, this.sessionId);
       const state = JSON.parse(result.result?.value || "{}");
+      const target = this.targets[this.targetIndex];
+      if (target) Object.assign(target, { title: state.title || "新标签页", url: state.url || "about:blank" });
       this.callbacks.onState?.({ type: "page", ...state, loading: false });
+      this.#emitTabsState();
     } catch {}
+  }
+
+  #emitTabsState() {
+    this.callbacks.onState?.({
+      type: "tabs",
+      activeId: this.targets[this.targetIndex]?.targetId || "",
+      tabs: this.targets.map((target) => ({
+        id: target.targetId,
+        title: target.title || "新标签页",
+        url: target.url || "about:blank",
+      })),
+    });
   }
 
   async #emitFocusState() {

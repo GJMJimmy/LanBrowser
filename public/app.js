@@ -1,5 +1,5 @@
 import { InteractionController, TouchScrollBuffer, normalizeWheel } from "/input.js?v=0.3.3";
-import { SequencedFrameReader } from "/stream.js?v=0.3.0";
+import { SequencedFrameReader } from "/stream.js?v=1.0.0";
 import { AudioPlaybackQueue, decodePcm } from "/audio.js?v=0.3.2";
 import { nextZoom, normalizeZoom } from "/zoom.js?v=0.3.4";
 
@@ -11,6 +11,7 @@ const elements = {
   viewport: $("#viewport"), frame: $("#frame"), empty: $("#empty-state"), loading: $("#loading-state"),
   loadingText: $("#loading-text"), connectForm: $("#connect-form"), connect: $("#connect"), token: $("#token"),
   error: $("#connect-error"), addressForm: $("#address-form"), address: $("#address"),
+  tabStrip: $("#tab-strip"), tabList: $("#tab-list"), newTab: $("#new-tab"),
   back: $("#back"), forward: $("#forward"), reload: $("#reload"), disconnect: $("#disconnect"),
   audioToggle: $("#audio-toggle"),
   interactionMode: $("#interaction-mode"),
@@ -21,7 +22,7 @@ const elements = {
   statusChip: $("#status-chip"), statusText: $("#status-text"), resolution: $("#resolution"), toast: $("#toast"),
 };
 
-const state = { peer: null, signal: null, control: null, frames: null, audio: null, audioContext: null, audioGain: null, audioQueue: null, audioFormat: null, audioMuted: false, frameUrl: "", pendingFrameUrl: "", connected: false, moving: false, resizeTimer: null, touchScrollRaf: 0, autoResolution: true, zoom: normalizeZoom(localStorage.getItem("lan-browser-zoom") || 100) };
+const state = { peer: null, signal: null, control: null, frames: null, audio: null, audioContext: null, audioGain: null, audioQueue: null, audioFormat: null, audioMuted: false, frameUrl: "", pendingFrameUrl: "", connected: false, moving: false, resizeTimer: null, touchScrollRaf: 0, autoResolution: true, zoom: normalizeZoom(localStorage.getItem("lan-browser-zoom") || 100), tabs: [], activeTabId: "" };
 const frameReader = new SequencedFrameReader();
 const storedInteractionMode = localStorage.getItem("lan-browser-interaction-mode");
 const defaultInteractionMode = storedInteractionMode || (matchMedia("(pointer: coarse)").matches ? "touch" : "computer");
@@ -38,7 +39,13 @@ function setRemoteEnabled(enabled) {
   state.connected = enabled;
   elements.viewport.classList.toggle("remote-active", enabled);
   elements.empty.hidden = enabled;
-  for (const element of [elements.address, elements.back, elements.forward, elements.reload, elements.disconnect, elements.audioToggle, elements.displaySettings, elements.interactionMode, elements.mobileKeyboard, elements.zoomPercent, elements.zoomReset, $(".go-button")]) element.disabled = !enabled;
+  for (const element of [elements.address, elements.back, elements.forward, elements.reload, elements.disconnect, elements.audioToggle, elements.displaySettings, elements.interactionMode, elements.mobileKeyboard, elements.zoomPercent, elements.zoomReset, elements.newTab, $(".go-button")]) element.disabled = !enabled;
+  elements.tabStrip.hidden = !enabled;
+  if (!enabled) {
+    state.tabs = [];
+    state.activeTabId = "";
+    renderTabs();
+  }
   updateZoomControls();
   if (enabled) elements.viewport.focus();
 }
@@ -182,8 +189,12 @@ function onControl(message) {
       elements.loadingText.textContent = message.message;
     }
   } else if (message.type === "page") {
-    if (document.activeElement !== elements.address) elements.address.value = message.url || "";
+    if (document.activeElement !== elements.address) elements.address.value = message.url === "about:blank" ? "" : (message.url || "");
     if (message.title) document.title = `${message.title} - LAN Browser`;
+  } else if (message.type === "tabs") {
+    state.tabs = Array.isArray(message.tabs) ? message.tabs : [];
+    state.activeTabId = message.activeId || "";
+    renderTabs();
   } else if (message.type === "focus") {
     if (message.editable) {
       elements.mobileInput.inputMode = message.inputMode || "text";
@@ -239,6 +250,44 @@ function onFrame(data) {
 
 function send(message) {
   if (state.control?.readyState === "open") state.control.send(JSON.stringify(message));
+}
+
+function renderTabs() {
+  elements.tabList.replaceChildren(...state.tabs.map((tab) => {
+    const item = document.createElement("div");
+    item.className = "tab-item";
+    item.dataset.tabId = tab.id;
+    item.setAttribute("role", "tab");
+    item.setAttribute("aria-selected", String(tab.id === state.activeTabId));
+
+    const select = document.createElement("button");
+    select.className = "tab-select";
+    select.type = "button";
+    select.dataset.action = "activate";
+    select.title = tab.title || tab.url || "新标签页";
+    select.textContent = tab.title || "新标签页";
+
+    const close = document.createElement("button");
+    close.className = "tab-close";
+    close.type = "button";
+    close.dataset.action = "close";
+    close.title = "关闭标签页";
+    close.setAttribute("aria-label", `关闭 ${select.textContent}`);
+    close.disabled = state.tabs.length <= 1;
+    const icon = document.createElement("i");
+    icon.dataset.lucide = "x";
+    close.append(icon);
+    item.append(select, close);
+    return item;
+  }));
+  lucide.createIcons();
+  elements.tabList.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+function newTab() {
+  send({ type: "tab-new" });
+  elements.address.focus();
+  elements.address.select();
 }
 
 function updateZoom(value, transmit = true) {
@@ -436,8 +485,17 @@ function sendResize(force = false) {
   }, 180);
 }
 window.addEventListener("resize", () => sendResize());
+new ResizeObserver(() => sendResize()).observe(elements.viewport);
 elements.connectForm.addEventListener("submit", (event) => { event.preventDefault(); connect(elements.token.value.trim()); });
 elements.addressForm.addEventListener("submit", (event) => { event.preventDefault(); send({ type: "navigate", url: elements.address.value }); elements.viewport.focus(); });
+elements.newTab.addEventListener("click", newTab);
+elements.tabList.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  const item = button?.closest(".tab-item");
+  if (!button || !item) return;
+  if (button.dataset.action === "close") send({ type: "tab-close", id: item.dataset.tabId });
+  else send({ type: "tab-activate", id: item.dataset.tabId });
+});
 elements.back.addEventListener("click", () => send({ type: "back" }));
 elements.forward.addEventListener("click", () => send({ type: "forward" }));
 elements.reload.addEventListener("click", () => send({ type: "reload" }));

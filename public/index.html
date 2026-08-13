@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>LAN Browser</title>
-  <link rel="stylesheet" href="/app.css?v=0.3.4">
+  <link rel="stylesheet" href="/app.css?v=1.0.0">
 </head>
 <body>
   <main class="app-shell">
@@ -34,6 +34,11 @@
       <button id="interaction-mode" class="icon-button" type="button" title="电脑操作（点击切换为触屏操作）" aria-label="切换为触屏操作" aria-pressed="false" disabled><i data-lucide="mouse-pointer-2"></i></button>
       <button id="mobile-keyboard" class="icon-button mobile-keyboard-button" type="button" title="键盘" disabled><i data-lucide="keyboard"></i></button>
     </header>
+
+    <nav id="tab-strip" class="tab-strip" aria-label="标签页" hidden>
+      <div id="tab-list" class="tab-list" role="tablist"></div>
+      <button id="new-tab" class="icon-button new-tab-button" type="button" title="新建标签页" aria-label="新建标签页" disabled><i data-lucide="plus"></i></button>
+    </nav>
 
     <section id="viewport" class="viewport" tabindex="0" aria-label="远程浏览器画面">
       <img id="frame" alt="远程浏览器画面" draggable="false">
@@ -87,6 +92,6 @@
     <textarea id="mobile-input" class="mobile-input" aria-label="远程键盘输入" inputmode="text" enterkeyhint="enter" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
   </main>
   <script src="/lucide.min.js"></script>
-  <script type="module" src="/app.js?v=0.3.4"></script>
+  <script type="module" src="/app.js?v=1.0.0"></script>
 </body>
 </html>

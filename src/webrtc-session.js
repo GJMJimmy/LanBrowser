@@ -23,7 +23,9 @@ export class WebRtcBrowserSession {
     this.browserReady = false;
     this.disconnectTimer = null;
     this.lastActivity = Date.now();
+    this.controlQueue = Promise.resolve();
     this.frameSequence = 0;
+    this.frameGeneration = 0;
     this.peer.onDataChannel.subscribe((channel) => this.#bindChannel(channel));
     this.peer.connectionStateChange.subscribe((state) => {
       this.callbacks.onConnectionState?.(state);
@@ -61,7 +63,10 @@ export class WebRtcBrowserSession {
   #bindChannel(channel) {
     if (channel.label === "control") {
       this.control = channel;
-      channel.onMessage.subscribe((data) => this.#onControl(data));
+      channel.onMessage.subscribe((data) => {
+        const run = () => this.#onControl(data);
+        this.controlQueue = this.controlQueue.then(run, run);
+      });
       channel.stateChanged.subscribe((state) => {
         if (state === "open") this.#maybeStartBrowser();
         else if (state === "closed") this.close();
@@ -87,7 +92,7 @@ export class WebRtcBrowserSession {
     if (this.edge || this.closed || this.control?.readyState !== "open" || this.frames?.readyState !== "open") return;
     if (this.config.audio && this.audioChannel?.readyState !== "open") return;
     this.edge = new EdgeSession(this.config, {
-      onFrame: (frame) => this.#sendFrame(frame),
+      onFrame: (frame, generation) => this.#sendFrame(frame, generation),
       onState: (state) => this.#sendControl(state),
       onAudioData: (data) => this.#sendAudio(data),
       onAudioReset: () => this.#sendAudioReset(),
@@ -128,11 +133,16 @@ export class WebRtcBrowserSession {
     if (this.control?.readyState === "open") this.control.send(JSON.stringify(message));
   }
 
-  #sendFrame(frame) {
+  #sendFrame(frame, generation) {
     if (this.frames?.readyState !== "open") return;
     if (this.frames.bufferedAmount > MAX_FRAME_BUFFER) return;
+    const nextGeneration = Number(generation) >>> 0;
+    if (nextGeneration !== this.frameGeneration) {
+      this.frameGeneration = nextGeneration;
+      this.frameSequence = 0;
+    }
     this.frameSequence = (this.frameSequence + 1) >>> 0 || 1;
-    this.frames.send(encodeFrame(this.frameSequence, frame));
+    this.frames.send(encodeFrame(this.frameGeneration, this.frameSequence, frame));
   }
 
   #sendAudio(data) {
